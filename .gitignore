@@ -3,3 +3,5 @@ __pycache__/
 data/
 export.csv
 *.bak
+receipts/
+review-receipts/
