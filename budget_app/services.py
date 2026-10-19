@@ -5,19 +5,28 @@ storage.py directly, so validation rules live in exactly one place.
 """
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterator
 
-from .exceptions import ConflictError, ValidationError
-from .models import VALID_TYPES, Transaction
-from .storage import BudgetStore, CategoryStore, TransactionRepository
+from .exceptions import ConflictError, NotFoundError, ValidationError
+from .models import VALID_TYPES, RecurringRule, Transaction
+from .storage import BudgetStore, CategoryStore, RecurringStore, TransactionRepository
+
+
+def _strict_parse(value: str, fmt: str) -> dt.datetime:
+    """strptime accepts "2024-1-5"; we require zero-padded input so stored
+    dates compare correctly as strings (search/summary rely on that)."""
+    parsed = dt.datetime.strptime(value, fmt)
+    if parsed.strftime(fmt) != value:
+        raise ValueError(value)
+    return parsed
 
 
 def validate_date(value: str) -> str:
     try:
-        dt.datetime.strptime(value, "%Y-%m-%d")
+        _strict_parse(value, "%Y-%m-%d")
     except ValueError as exc:
         raise ValidationError(
             "날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).",
@@ -28,12 +37,25 @@ def validate_date(value: str) -> str:
 
 def validate_month(value: str) -> str:
     try:
-        dt.datetime.strptime(value, "%Y-%m")
+        _strict_parse(value, "%Y-%m")
     except ValueError as exc:
         raise ValidationError(
             "월 형식이 올바르지 않습니다 (YYYY-MM).",
             hint="예: 2024-01",
         ) from exc
+    return value
+
+
+def month_range(month: str) -> tuple[str, str]:
+    """Return (first_day, last_day) of a YYYY-MM month as YYYY-MM-DD strings."""
+    year, mon = map(int, validate_month(month).split("-"))
+    last = calendar.monthrange(year, mon)[1]
+    return f"{month}-01", f"{month}-{last:02d}"
+
+
+def validate_positive_int(value: int, option: str) -> int:
+    if value <= 0:
+        raise ValidationError(f"{option} 값은 1 이상이어야 합니다.", hint=f"예: {option} 5")
     return value
 
 
@@ -65,9 +87,15 @@ def parse_tags(value: str) -> list[str]:
 
 
 class CategoryService:
-    def __init__(self, categories: CategoryStore, transactions: TransactionRepository) -> None:
+    def __init__(
+        self,
+        categories: CategoryStore,
+        transactions: TransactionRepository,
+        recurring: RecurringStore | None = None,
+    ) -> None:
         self.categories = categories
         self.transactions = transactions
+        self.recurring = recurring
 
     def list(self) -> list[str]:
         return self.categories.list()
@@ -85,6 +113,11 @@ class CategoryService:
             raise ConflictError(
                 f"카테고리 '{name}'을(를) 사용 중인 거래가 있어 삭제할 수 없습니다.",
                 hint="해당 거래를 먼저 update로 다른 카테고리로 옮기세요.",
+            )
+        if self.recurring and any(rule.category == name for rule in self.recurring.list()):
+            raise ConflictError(
+                f"카테고리 '{name}'을(를) 사용 중인 반복 내역이 있어 삭제할 수 없습니다.",
+                hint="recurring remove로 해당 반복 내역을 먼저 삭제하세요.",
             )
         self.categories.remove(name)
 
@@ -104,6 +137,18 @@ class SearchFilter:
     type_: str | None = None
     query: str | None = None
     tag: str | None = None
+
+    def __post_init__(self) -> None:
+        # Validate once up front so a typo (e.g. --type expnse) is an error,
+        # not a silent "no results".
+        if self.date_from:
+            validate_date(self.date_from)
+        if self.date_to:
+            validate_date(self.date_to)
+        if self.type_:
+            validate_type(self.type_)
+        if self.date_from and self.date_to and self.date_from > self.date_to:
+            raise ValidationError("--from 날짜가 --to 날짜보다 늦습니다.", hint="예: --from 2024-01-01 --to 2024-01-31")
 
     def matches(self, txn: Transaction) -> bool:
         if self.date_from and txn.date < self.date_from:
@@ -245,3 +290,77 @@ class BudgetService:
             usage_pct=usage_pct,
             over_budget=over_budget,
         )
+
+
+class RecurringService:
+    """[Bonus] Register monthly recurring items (salary, rent...) and
+    generate the matching transactions for a given month."""
+
+    def __init__(
+        self,
+        rules: RecurringStore,
+        transactions: TransactionService,
+        categories: CategoryService,
+    ) -> None:
+        self.rules = rules
+        self.transactions = transactions
+        self.categories = categories
+
+    def add(self, type_: str, day: str, category: str, amount: str, memo: str = "", tags: str = "") -> RecurringRule:
+        try:
+            day_i = int(day)
+        except ValueError:
+            day_i = 0
+        if not 1 <= day_i <= 31:
+            raise ValidationError("day는 1~31 사이 숫자여야 합니다.", hint="예: --day 25")
+        self.categories.require_exists(category)
+        rule = RecurringRule(
+            id=self.rules.next_id(),
+            type=validate_type(type_),
+            day=day_i,
+            amount=validate_amount(amount),
+            category=category,
+            memo=memo,
+            tags=parse_tags(tags),
+        )
+        self.rules.save_all(self.rules.list() + [rule])
+        return rule
+
+    def list(self) -> list[RecurringRule]:
+        return self.rules.list()
+
+    def remove(self, rule_id: str) -> None:
+        rules = self.rules.list()
+        remaining = [r for r in rules if r.id != rule_id]
+        if len(remaining) == len(rules):
+            raise NotFoundError(
+                f"반복 내역을 찾을 수 없습니다 (id={rule_id})",
+                hint="recurring list로 존재하는 id를 확인하세요.",
+            )
+        self.rules.save_all(remaining)
+
+    def apply(self, month: str) -> tuple[list[Transaction], int]:
+        """Create this month's transactions. Returns (created, skipped_already_applied)."""
+        _, last_day = month_range(month)
+        last_dom = int(last_day[-2:])
+        rules = self.rules.list()
+        created: list[Transaction] = []
+        skipped = 0
+        for rule in rules:
+            if month in rule.applied_months:
+                skipped += 1
+                continue
+            day = min(rule.day, last_dom)  # e.g. day 31 -> Feb 28/29
+            created.append(
+                self.transactions.add(
+                    date=f"{month}-{day:02d}",
+                    type_=rule.type,
+                    category=rule.category,
+                    amount=str(rule.amount),
+                    memo=rule.memo,
+                    tags=",".join(rule.tags),
+                )
+            )
+            rule.applied_months.append(month)
+        self.rules.save_all(rules)
+        return created, skipped

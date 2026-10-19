@@ -16,8 +16,7 @@ CSV_COLUMNS = ["date", "type", "category", "amount", "memo", "tags"]
 
 
 def export_csv(service: TransactionService, out_path: Path, filt: SearchFilter) -> int:
-    rows = list(service.search(filt))
-    rows.reverse()  # export in chronological order
+    rows = sorted(service.search(filt), key=lambda t: (t.date, t.id))  # chronological order
     with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()

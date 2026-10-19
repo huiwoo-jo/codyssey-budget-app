@@ -15,10 +15,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .exceptions import ConflictError, NotFoundError
-from .models import Transaction
+from .models import RecurringRule, Transaction
 
 
 def _ensure_parent(path: Path) -> None:
@@ -70,14 +70,33 @@ def append_line(path: Path, row: dict[str, Any]) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def rewrite_all(path: Path, rows: list[dict[str, Any]]) -> None:
-    """Atomically replace the file's contents (used by update/delete)."""
+def rewrite_all(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    """Atomically replace the file's contents (used by update/delete).
+
+    rows may be a generator that is still reading the original file: we only
+    ever write to the temp file, and the original is swapped in one
+    os.replace. If anything raises mid-way, the temp file is discarded and
+    the original file is left untouched.
+    """
     _ensure_parent(path)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())  # data must be on disk before the rename
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     os.replace(tmp_path, path)
+
+
+def _not_found(txn_id: str) -> NotFoundError:
+    return NotFoundError(
+        f"거래를 찾을 수 없습니다 (id={txn_id})",
+        hint="list 명령으로 존재하는 id를 확인하세요.",
+    )
 
 
 class TransactionRepository:
@@ -85,16 +104,24 @@ class TransactionRepository:
 
     def __init__(self, data_dir: Path) -> None:
         self.path = data_dir / "transactions.jsonl"
+        # Last issued id number. Kept separately so deleting the newest
+        # transaction never causes its id to be handed out again.
+        self.seq_path = data_dir / "transactions.seq"
+
+    def _last_issued(self) -> int:
+        from_seq = int(self.seq_path.read_text()) if self.seq_path.exists() else 0
+        from_file = 0
+        for raw in iter_reverse(self.path):
+            from_file = int(str(json.loads(raw)["id"]).split("-")[-1])
+            break
+        return max(from_seq, from_file)
 
     def next_id(self) -> str:
-        for raw in iter_reverse(self.path):
-            last = json.loads(raw)
-            num = int(str(last["id"]).split("-")[-1])
-            return f"TX-{num + 1:06d}"
-        return "TX-000001"
+        return f"TX-{self._last_issued() + 1:06d}"
 
     def add(self, txn: Transaction) -> None:
         append_line(self.path, txn.to_dict())
+        self.seq_path.write_text(str(int(txn.id.split("-")[-1])))
 
     def iter_newest_first(self) -> Iterator[Transaction]:
         for raw in iter_reverse(self.path):
@@ -104,40 +131,42 @@ class TransactionRepository:
         for txn in self.iter_all():
             if txn.id == txn_id:
                 return txn
-        raise NotFoundError(
-            f"거래를 찾을 수 없습니다 (id={txn_id})",
-            hint="list 명령으로 존재하는 id를 확인하세요.",
-        )
+        raise _not_found(txn_id)
 
     def iter_all(self) -> Iterator[Transaction]:
         for row in iter_forward(self.path):
             yield Transaction.from_dict(row)
 
+    # update/delete stream old file -> temp file row by row (memory stays O(1));
+    # raising at the end for a missing id makes rewrite_all discard the temp file.
+
     def update(self, txn_id: str, **changes: Any) -> Transaction:
-        rows = list(iter_forward(self.path))
-        updated: Transaction | None = None
-        for row in rows:
-            if row["id"] == txn_id:
-                row.update({k: v for k, v in changes.items() if v is not None})
-                updated = Transaction.from_dict(row)
-                break
-        if updated is None:
-            raise NotFoundError(
-                f"거래를 찾을 수 없습니다 (id={txn_id})",
-                hint="list 명령으로 존재하는 id를 확인하세요.",
-            )
-        rewrite_all(self.path, rows)
-        return updated
+        updated: list[Transaction] = []
+
+        def rows() -> Iterator[dict[str, Any]]:
+            for row in iter_forward(self.path):
+                if row["id"] == txn_id:
+                    row.update({k: v for k, v in changes.items() if v is not None})
+                    updated.append(Transaction.from_dict(row))
+                yield row
+            if not updated:
+                raise _not_found(txn_id)
+
+        rewrite_all(self.path, rows())
+        return updated[0]
 
     def delete(self, txn_id: str) -> None:
-        rows = list(iter_forward(self.path))
-        remaining = [row for row in rows if row["id"] != txn_id]
-        if len(remaining) == len(rows):
-            raise NotFoundError(
-                f"거래를 찾을 수 없습니다 (id={txn_id})",
-                hint="list 명령으로 존재하는 id를 확인하세요.",
-            )
-        rewrite_all(self.path, remaining)
+        def rows() -> Iterator[dict[str, Any]]:
+            found = False
+            for row in iter_forward(self.path):
+                if row["id"] == txn_id:
+                    found = True
+                    continue
+                yield row
+            if not found:
+                raise _not_found(txn_id)
+
+        rewrite_all(self.path, rows())
 
     def category_in_use(self, category: str) -> bool:
         return any(txn.category == category for txn in self.iter_all())
@@ -190,3 +219,20 @@ class BudgetStore:
         rows = [row for row in iter_forward(self.path) if row["month"] != month]
         rows.append({"month": month, "amount": amount})
         rewrite_all(self.path, rows)
+
+
+class RecurringStore:
+    """[Bonus] Persists recurring-transaction rules to recurring.jsonl."""
+
+    def __init__(self, data_dir: Path) -> None:
+        self.path = data_dir / "recurring.jsonl"
+
+    def list(self) -> list[RecurringRule]:
+        return [RecurringRule.from_dict(row) for row in iter_forward(self.path)]
+
+    def save_all(self, rules: list[RecurringRule]) -> None:
+        rewrite_all(self.path, [rule.to_dict() for rule in rules])
+
+    def next_id(self) -> str:
+        nums = [int(rule.id.split("-")[-1]) for rule in self.list()]
+        return f"RC-{max(nums, default=0) + 1:03d}"

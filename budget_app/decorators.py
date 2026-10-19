@@ -27,6 +27,10 @@ def handle_errors(func: F) -> F:
             if exc.hint:
                 print(f"[힌트] {exc.hint}", file=sys.stderr)
             return 1
+        except EOFError:
+            print("\n[오류] 입력이 끝나 더 읽을 값이 없습니다.", file=sys.stderr)
+            print("[힌트] 대화형 명령은 터미널에서 직접 실행하거나 모든 항목을 입력하세요.", file=sys.stderr)
+            return 1
         except KeyboardInterrupt:
             print("\n[중단] 사용자가 입력을 취소했습니다.", file=sys.stderr)
             return 1
